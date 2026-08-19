@@ -2,9 +2,12 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from urllib.parse import unquote_plus
 
+from paper_spider.config import Settings
 from paper_spider.models import Paper
-from paper_spider.pipeline import load_seen, rank, report_window, save_seen
+from paper_spider.pipeline import fetch_arxiv, load_seen, rank, report_window, save_seen
 
 
 def make_paper(title: str, score_hint: int = 0) -> Paper:
@@ -41,3 +44,10 @@ class PipelineTest(unittest.TestCase):
             save_seen(state, [make_paper("first")])
             save_seen(state, [])
             self.assertEqual(load_seen(state), {"2601.00001"})
+
+    def test_arxiv_query_uses_the_report_window(self):
+        settings = Settings(10, 60, ["cs.AI"], [], [])
+        empty_feed = b'<feed xmlns="http://www.w3.org/2005/Atom" />'
+        with patch("paper_spider.pipeline._request_arxiv", return_value=empty_feed) as request:
+            fetch_arxiv(settings, datetime(2026, 8, 13, tzinfo=timezone.utc), datetime(2026, 8, 17, 23, 59, tzinfo=timezone.utc))
+        self.assertIn("submittedDate:[202608130000 TO 202608172359]", unquote_plus(request.call_args.args[0]))

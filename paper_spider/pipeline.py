@@ -79,10 +79,16 @@ def _clean(value: str | None) -> str:
 
 def fetch_arxiv(settings: Settings, start: datetime, end: datetime) -> list[Paper]:
     categories = " OR ".join(f"cat:{category}" for category in settings.arxiv_categories)
-    # arXiv's documented submittedDate filter intermittently returns HTTP 500. Fetch a
-    # bounded newest slice and apply the exact time window locally instead.
-    params = urlencode({"search_query": f"({categories})", "start": 0, "max_results": settings.candidate_limit, "sortBy": "submittedDate", "sortOrder": "descending"})
-    root = ET.fromstring(_request_arxiv(f"{ARXIV_API}?{params}"))
+    date_range = f"submittedDate:[{start:%Y%m%d%H%M} TO {end:%Y%m%d%H%M}]"
+    params = urlencode({"search_query": f"({categories}) AND {date_range}", "start": 0, "max_results": settings.candidate_limit, "sortBy": "submittedDate", "sortOrder": "descending"})
+    try:
+        response = _request_arxiv(f"{ARXIV_API}?{params}")
+    except HTTPError:
+        # The documented date filter can intermittently return HTTP 500. Retain a
+        # bounded newest-slice fallback so a scheduled issue can still be produced.
+        fallback = urlencode({"search_query": f"({categories})", "start": 0, "max_results": settings.candidate_limit, "sortBy": "submittedDate", "sortOrder": "descending"})
+        response = _request_arxiv(f"{ARXIV_API}?{fallback}")
+    root = ET.fromstring(response)
 
     papers: list[Paper] = []
     for entry in root.findall(f"{ATOM}entry"):
