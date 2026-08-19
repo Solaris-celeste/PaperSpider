@@ -1,0 +1,31 @@
+name: Twice-weekly AI paper brief
+
+on:
+  schedule:
+    # 00:00 Asia/Shanghai on Monday and Thursday. GitHub Actions has no resident process.
+    - cron: "0 16 * * 0,3"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Generate brief
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: python -m paper_spider --date "$(TZ=Asia/Shanghai date +%F)"
+      - name: Commit report
+        run: |
+          git add reports data/seen.json
+          git diff --cached --quiet || git commit -m "docs: add AI paper brief"
+          git push

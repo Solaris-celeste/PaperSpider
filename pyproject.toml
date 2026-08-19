@@ -1,0 +1,8 @@
+[project]
+name = "paper-spider"
+version = "0.1.0"
+description = "Twice-weekly AI paper intelligence brief"
+requires-python = ">=3.10"
+
+[project.scripts]
+paper-spider = "paper_spider.cli:main"

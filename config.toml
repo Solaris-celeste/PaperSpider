@@ -1,0 +1,17 @@
+# Target count is clamped to 5-15 to keep each issue readable.
+target_papers = 10
+candidate_limit = 60
+report_language = "zh-CN"
+
+# arXiv categories are the primary, fresh-paper source.
+arxiv_categories = ["cs.AI", "cs.CL", "cs.CV", "cs.LG", "stat.ML"]
+
+# A conference mention in arXiv's comment field earns a modest ranking boost.
+conferences = ["ICLR", "ICML", "NeurIPS", "ACL", "EMNLP", "CVPR"]
+
+# Keep the brief focused. Add or remove terms to adapt the editorial scope.
+topics = [
+  "large language model", "language model", "llm", "reasoning", "agent",
+  "generative", "diffusion", "reinforcement learning", "world model",
+  "multimodal", "vision-language", "foundation model", "robotics"
+]
