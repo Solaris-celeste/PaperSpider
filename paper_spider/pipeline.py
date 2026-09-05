@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 import time as clock
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -61,7 +62,7 @@ def _request_arxiv(url: str) -> bytes:
     request = Request(url, headers={"User-Agent": "PaperSpider/0.1 (research brief)"})
     for attempt, delay in enumerate((5, 15, 0)):
         try:
-            with urlopen(request, timeout=90) as response:  # nosec B310: fixed endpoint
+            with urlopen(request, timeout=30) as response:  # nosec B310: fixed endpoint
                 return response.read()
         except HTTPError as error:
             if error.code not in (429, 500, 502, 503, 504) or attempt == 2:
@@ -95,7 +96,7 @@ def fetch_arxiv(settings: Settings, start: datetime, end: datetime) -> list[Pape
         published = datetime.fromisoformat(entry.findtext(f"{ATOM}published", "").replace("Z", "+00:00"))
         updated = datetime.fromisoformat(entry.findtext(f"{ATOM}updated", "").replace("Z", "+00:00"))
         url = entry.findtext(f"{ATOM}id", "")
-        paper_id = url.rsplit("/", 1)[-1]
+        paper_id = canonical_id(url.rsplit("/", 1)[-1])
         papers.append(Paper(
             arxiv_id=paper_id,
             title=_clean(entry.findtext(f"{ATOM}title")),
@@ -113,7 +114,7 @@ def fetch_arxiv(settings: Settings, start: datetime, end: datetime) -> list[Pape
 def classify(paper: Paper, settings: Settings) -> None:
     text = f"{paper.title} {paper.abstract}".lower()
     matching_topics = [label for label, terms in TOPIC_RULES if any(term in text for term in terms)]
-    paper.topic = " / ".join(matching_topics[:2]) or "其他 AI"
+    paper.topic = max(TOPIC_RULES, key=lambda rule: sum(term in text for term in rule[1]))[0] if matching_topics else "其他 AI"
     paper.relevance = sum(term in text for term in settings.topics)
     comment = paper.comment.upper()
     paper.conference = next((name for name in settings.conferences if name in comment), None)
@@ -141,7 +142,7 @@ def enrich_semantic_scholar(papers: list[Paper]) -> None:
                 paper.citations = int(item.get("citationCount") or 0)
                 if paper.citations:
                     paper.signals.append(f"Semantic Scholar 引用 {paper.citations}")
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+    except (HTTPError, URLError, TimeoutError, ValueError, TypeError, KeyError):
         return
 
 
@@ -166,7 +167,7 @@ def enrich_github(paper: Paper) -> None:
             paper.github_stars = int(best.get("stargazers_count") or 0)
             paper.github_url = best.get("html_url")
             paper.signals.append(f"GitHub {paper.github_stars:,} stars")
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+    except (HTTPError, URLError, TimeoutError, ValueError, TypeError, KeyError):
         return
 
 
@@ -177,7 +178,7 @@ def enrich_hacker_news(paper: Paper) -> None:
         paper.hn_points = max((int(hit.get("points") or 0) for hit in matches), default=0)
         if paper.hn_points:
             paper.signals.append(f"Hacker News {paper.hn_points} points")
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+    except (HTTPError, URLError, TimeoutError, ValueError, TypeError, KeyError):
         return
 
 
@@ -186,19 +187,31 @@ def enrich_social_signals(papers: list[Paper]) -> None:
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(func, paper) for paper in papers for func in (enrich_github, enrich_hacker_news)]
         for future in as_completed(futures):
-            future.result()
+            try:
+                future.result()
+            except Exception as error:
+                print(f"warning: optional enrichment failed: {type(error).__name__}", file=sys.stderr)
 
 
 def rank(papers: list[Paper], target: int) -> list[Paper]:
     for paper in papers:
         paper.score = (
-            paper.relevance * 8
+            min(paper.relevance, 4) * 8
+            + min(20, math.log1p(paper.community_votes) * 5)
             + (15 if paper.conference else 0)
             + min(30, math.log1p(paper.github_stars) * 4)
             + min(20, math.log1p(paper.citations) * 4)
             + min(15, math.log1p(paper.hn_points) * 3)
         )
-    selected = sorted(papers, key=lambda item: (item.score, item.published), reverse=True)[:target]
+    ordered = sorted(papers, key=lambda item: (item.score, item.published), reverse=True)
+    # Give each available primary field a place before filling by score.
+    selected, fields = [], set()
+    for paper in ordered:
+        if paper.topic not in fields and len(selected) < target:
+            selected.append(paper)
+            fields.add(paper.topic)
+    selected.extend(paper for paper in ordered if paper not in selected)
+    selected = sorted(selected[:target], key=lambda item: item.score, reverse=True)
     if not selected:
         return []
     high, low = selected[0].score, selected[-1].score
@@ -210,8 +223,12 @@ def rank(papers: list[Paper], target: int) -> list[Paper]:
 
 def fallback_summary(paper: Paper) -> str:
     sentences = re.split(r"(?<=[.!?])\s+", paper.abstract)
-    excerpt = " ".join(sentences[:2]).strip()
-    return f"这项工作属于{paper.topic}方向。{excerpt}" if excerpt else f"这项工作属于{paper.topic}方向，建议结合原文摘要进一步评估。"
+    methods = [sentence for sentence in sentences if re.search(
+        r"\b(we (present|propose|introduce|develop|show|find)|our (method|approach|results))\b", sentence, re.I)]
+    excerpt = " ".join((methods or sentences)[:2]).strip()
+    if len(excerpt) > 650:
+        excerpt = excerpt[:647].rsplit(" ", 1)[0] + "…"
+    return f"摘要原文节选（中文生成未启用或不可用）：{excerpt}" if excerpt else f"这项工作属于{paper.topic}方向，建议结合原文摘要进一步评估。"
 
 
 def summarize_with_llm(papers: list[Paper]) -> None:
@@ -233,21 +250,21 @@ def summarize_with_llm(papers: list[Paper]) -> None:
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 body={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2},
             )
-            paper.summary = _clean(response["choices"][0]["message"]["content"])
-        except (HTTPError, URLError, TimeoutError, ValueError, KeyError, IndexError, json.JSONDecodeError):
+            paper.summary = _clean(response["choices"][0]["message"]["content"]) or fallback_summary(paper)
+        except (HTTPError, URLError, TimeoutError, ValueError, TypeError, KeyError, IndexError):
             paper.summary = fallback_summary(paper)
 
 
 def load_seen(path: Path) -> set[str]:
     try:
-        return set(json.loads(path.read_text(encoding="utf-8")))
+        return {canonical_id(item) for item in json.loads(path.read_text(encoding="utf-8"))}
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
 
 
 def save_seen(path: Path, papers: list[Paper]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    seen = load_seen(path) | {paper.arxiv_id for paper in papers}
+    seen = load_seen(path) | {canonical_id(paper.arxiv_id) for paper in papers}
     path.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -255,7 +272,7 @@ def render_report(papers: list[Paper], start: datetime, end: datetime) -> str:
     lines = [
         f"# AI 论文双报 | {end:%Y-%m-%d}",
         "",
-        f"> 覆盖时间：{start:%Y-%m-%d} 至 {end:%Y-%m-%d}（UTC）。从 arXiv 新投稿中筛选，并以代码热度、引用和公开社区讨论信号辅助排序。",
+        f"> 覆盖时间：{start:%Y-%m-%d} 至 {end:%Y-%m-%d}（UTC）。从 arXiv 与 Hugging Face Daily Papers 等入口获取摘要元数据，按首次发布日期筛选；不下载 PDF。",
         "> 星级是本期候选间的相对优先级，不代表论文质量的绝对评价。",
         "",
         "## 本期精选",
@@ -269,6 +286,7 @@ def render_report(papers: list[Paper], start: datetime, end: datetime) -> str:
             "",
             f"- **领域**：{paper.topic}",
             f"- **提交**：{paper.published:%Y-%m-%d} | **作者**：{', '.join(paper.authors[:4])}{' 等' if len(paper.authors) > 4 else ''}",
+            f"- **来源**：{'、'.join(paper.sources)}",
             f"- **信号**：{'；'.join(paper.signals) if paper.signals else '新近投稿，暂未观测到外部热度信号'}",
             f"- **代码**：[{paper.github_url}]({paper.github_url})" if paper.github_url else "- **代码**：未检索到高置信度公开仓库",
             f"- **摘要**：{paper.summary}",
@@ -277,7 +295,94 @@ def render_report(papers: list[Paper], start: datetime, end: datetime) -> str:
     lines.extend([
         "## 方法说明",
         "",
-        "候选来自 `cs.AI`、`cs.CL`、`cs.CV`、`cs.LG`、`stat.ML` 的 arXiv 新投稿。排序将主题相关性、顶会备注、GitHub stars、Semantic Scholar 引用和 Hacker News 讨论度合并为可解释分数；服务不可用时对应信号为零，不会阻断出报。",
+        "候选合并 arXiv 新投稿和 Hugging Face 社区精选，按论文 ID 与标题去重，并优先覆盖不同领域。排序将主题相关性、顶会备注、GitHub stars、Semantic Scholar 引用和 Hacker News 讨论度合并为可解释分数；服务不可用时对应信号为零，不会阻断出报。",
         "",
     ])
     return "\n".join(lines)
+
+
+def canonical_id(value: str) -> str:
+    return re.sub(r"v\d+$", "", value)
+
+
+def fetch_huggingface(settings: Settings, start: datetime, end: datetime) -> list[Paper]:
+    papers = []
+    successes = 0
+    day = start.date()
+    while day <= end.date():
+        try:
+            entries = _request_json(f"https://huggingface.co/api/daily_papers?date={day.isoformat()}")
+            if not isinstance(entries, list):
+                raise ValueError("expected a paper list")
+            successes += 1
+            for entry in entries:
+                try:
+                    item = entry["paper"]
+                    published = datetime.fromisoformat(item["publishedAt"].replace("Z", "+00:00"))
+                    if not start <= published <= end or not item.get("summary"):
+                        continue
+                    paper_id = canonical_id(item["id"])
+                    if not re.fullmatch(r"\d{4}\.\d{4,5}", paper_id):
+                        continue
+                    paper = Paper(paper_id, _clean(item["title"]), _clean(item["summary"]),
+                                  f"https://arxiv.org/abs/{paper_id}", published, published,
+                                  [a["name"] for a in item.get("authors", [])], [],
+                                  sources=["Hugging Face Daily Papers"],
+                                  community_votes=max(0, int(item.get("upvotes") or 0)))
+                    paper.github_url = item.get("githubRepo")
+                    paper.github_stars = max(0, int(item.get("githubStars") or 0))
+                    paper.signals.append(f"Hugging Face 社区推荐 {paper.community_votes} 票")
+                    papers.append(paper)
+                except (ValueError, TypeError, KeyError):
+                    continue
+        except Exception as error:
+            print(f"warning: Hugging Face {day}: {type(error).__name__}", file=sys.stderr)
+        day += timedelta(days=1)
+    if not successes:
+        raise RuntimeError("all daily feed requests failed")
+    return papers
+
+
+def collect_papers(settings: Settings, start: datetime, end: datetime) -> tuple[list[Paper], list[str]]:
+    merged: dict[str, Paper] = {}
+    titles: dict[str, str] = {}
+    warnings = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        jobs = {executor.submit(fetcher, settings, start, end): name for name, fetcher in
+                (("arXiv", fetch_arxiv), ("Hugging Face", fetch_huggingface))}
+        for future in as_completed(jobs):
+            name = jobs[future]
+            try:
+                fetched = future.result()
+                print(f"{name}: {len(fetched)} candidates", flush=True)
+                if not fetched:
+                    warnings.append(f"{name} 本窗口返回 0 篇论文")
+                for paper in fetched:
+                    if not start <= paper.published <= end:
+                        continue
+                    key = canonical_id(paper.arxiv_id)
+                    title = " ".join(re.findall(r"\w+", paper.title.casefold()))
+                    key = titles.get(title, key)
+                    if key in merged:
+                        previous = merged[key]
+                        previous.sources = sorted(set(previous.sources + paper.sources))
+                        previous.community_votes = max(previous.community_votes, paper.community_votes)
+                        previous.github_stars = max(previous.github_stars, paper.github_stars)
+                        previous.github_url = previous.github_url or paper.github_url
+                        previous.comment = previous.comment or paper.comment
+                        previous.signals = sorted(set(previous.signals + paper.signals))
+                    else:
+                        paper.arxiv_id = key
+                        merged[key] = paper
+                        titles[title] = key
+            except Exception as error:
+                warnings.append(f"{name} 获取失败（{type(error).__name__}），本期使用其余来源")
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return list(merged.values()), warnings
+
+
+def latest_issue_day(today: date) -> date:
+    while today.weekday() not in (0, 3):
+        today -= timedelta(days=1)
+    return today

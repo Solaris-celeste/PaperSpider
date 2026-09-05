@@ -23,4 +23,6 @@ class Paper:
     score: float = 0.0
     stars: int = 1
     summary: str = ""
+    sources: list[str] = field(default_factory=lambda: ["arXiv"])
+    community_votes: int = 0
     signals: list[str] = field(default_factory=list)
